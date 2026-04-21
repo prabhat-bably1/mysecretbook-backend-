@@ -24,8 +24,9 @@ const MONGODB_URI = process.env.MONGODB_URI;
 // ======================
 mongoose
   .connect(MONGODB_URI)
-  .then(() => {
+  .then(async () => {
     console.log("MongoDB Connected ✅");
+    await createDefaultAdmin();
   })
   .catch((err) => {
     console.error("MongoDB Connection Error ❌", err.message);
@@ -59,10 +60,21 @@ const userSchema = new mongoose.Schema(
       unique: true,
       lowercase: true,
     },
+    phone: {
+      type: String,
+      default: "",
+      trim: true,
+    },
     password: {
       type: String,
       required: true,
       minlength: 6,
+    },
+    secretId: {
+      type: String,
+      unique: true,
+      sparse: true,
+      default: "",
     },
     bio: {
       type: String,
@@ -72,6 +84,22 @@ const userSchema = new mongoose.Schema(
     profileImage: {
       type: String,
       default: "",
+    },
+    privacy: {
+      type: String,
+      default: "Private Profile",
+    },
+    blocked: {
+      type: Boolean,
+      default: false,
+    },
+    blockedReason: {
+      type: String,
+      default: "",
+    },
+    isAdmin: {
+      type: Boolean,
+      default: false,
     },
   },
   { timestamps: true }
@@ -109,6 +137,18 @@ const postSchema = new mongoose.Schema(
       type: String,
       required: true,
     },
+    secretId: {
+      type: String,
+      default: "",
+    },
+    email: {
+      type: String,
+      default: "",
+    },
+    phone: {
+      type: String,
+      default: "",
+    },
     text: {
       type: String,
       default: "",
@@ -137,6 +177,69 @@ const User = mongoose.model("User", userSchema);
 const Post = mongoose.model("Post", postSchema);
 
 // ======================
+// Helpers
+// ======================
+function makeSecretId(username) {
+  const clean = String(username || "user")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "")
+    .replace(/[^a-z0-9_]/g, "");
+  return `${clean}@mysecretbook`;
+}
+
+async function createDefaultAdmin() {
+  try {
+    const adminEmail = process.env.ADMIN_EMAIL;
+    const adminPassword = process.env.ADMIN_PASSWORD;
+
+    if (!adminEmail || !adminPassword) {
+      console.log("Admin env not found");
+      return;
+    }
+
+    const existingAdmin = await User.findOne({
+      email: adminEmail.toLowerCase(),
+    });
+
+    if (existingAdmin) {
+      if (!existingAdmin.isAdmin) {
+        existingAdmin.isAdmin = true;
+        existingAdmin.blocked = false;
+        existingAdmin.blockedReason = "";
+        if (!existingAdmin.secretId) {
+          existingAdmin.secretId = "admin@mysecretbook";
+        }
+        await existingAdmin.save();
+      }
+      console.log("Admin already exists");
+      return;
+    }
+
+    const hashedPassword = await bcrypt.hash(adminPassword, 10);
+
+    const adminUser = await User.create({
+      name: "Admin",
+      username: "adminmsb",
+      email: adminEmail.toLowerCase(),
+      phone: "",
+      password: hashedPassword,
+      secretId: "admin@mysecretbook",
+      bio: "Default admin",
+      profileImage: "",
+      privacy: "Private Profile",
+      blocked: false,
+      blockedReason: "",
+      isAdmin: true,
+    });
+
+    console.log("Default admin created:", adminUser.email);
+  } catch (error) {
+    console.log("Default admin create error:", error.message);
+  }
+}
+
+// ======================
 // Auth Middleware
 // ======================
 const auth = async (req, res, next) => {
@@ -154,10 +257,20 @@ const auth = async (req, res, next) => {
     const decoded = jwt.verify(token, JWT_SECRET);
 
     const user = await User.findById(decoded.id).select("-password");
+
     if (!user) {
       return res.status(401).json({
         success: false,
         message: "Invalid token user",
+      });
+    }
+
+    if (user.blocked) {
+      return res.status(403).json({
+        success: false,
+        message: "Your account is blocked",
+        blocked: true,
+        blockedReason: user.blockedReason || "",
       });
     }
 
@@ -167,6 +280,47 @@ const auth = async (req, res, next) => {
     return res.status(401).json({
       success: false,
       message: "Unauthorized",
+      error: error.message,
+    });
+  }
+};
+
+const adminAuth = async (req, res, next) => {
+  try {
+    const header = req.headers.authorization;
+
+    if (!header || !header.startsWith("Bearer ")) {
+      return res.status(401).json({
+        success: false,
+        message: "No token provided",
+      });
+    }
+
+    const token = header.split(" ")[1];
+    const decoded = jwt.verify(token, JWT_SECRET);
+
+    const user = await User.findById(decoded.id).select("-password");
+
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        message: "Invalid token user",
+      });
+    }
+
+    if (!user.isAdmin) {
+      return res.status(403).json({
+        success: false,
+        message: "Admin access denied",
+      });
+    }
+
+    req.user = user;
+    next();
+  } catch (error) {
+    return res.status(401).json({
+      success: false,
+      message: "Unauthorized admin",
       error: error.message,
     });
   }
@@ -186,16 +340,19 @@ app.get("/", (req, res) => {
 // Signup
 app.post("/api/auth/signup", async (req, res) => {
   try {
-    const { name, username, email, password } = req.body;
+    const { name, username, email, phone, password, privacy } = req.body;
 
     if (!name || !username || !email || !password) {
       return res.status(400).json({
         success: false,
-        message: "All fields are required",
+        message: "Name, username, email and password are required",
       });
     }
 
-    const existingEmail = await User.findOne({ email: email.toLowerCase() });
+    const emailLower = email.toLowerCase();
+    const usernameLower = username.toLowerCase();
+
+    const existingEmail = await User.findOne({ email: emailLower });
     if (existingEmail) {
       return res.status(400).json({
         success: false,
@@ -203,9 +360,7 @@ app.post("/api/auth/signup", async (req, res) => {
       });
     }
 
-    const existingUsername = await User.findOne({
-      username: username.toLowerCase(),
-    });
+    const existingUsername = await User.findOne({ username: usernameLower });
     if (existingUsername) {
       return res.status(400).json({
         success: false,
@@ -213,13 +368,26 @@ app.post("/api/auth/signup", async (req, res) => {
       });
     }
 
+    const secretId = makeSecretId(usernameLower);
+
+    const existingSecretId = await User.findOne({ secretId });
+    if (existingSecretId) {
+      return res.status(400).json({
+        success: false,
+        message: "Try another username",
+      });
+    }
+
     const hashedPassword = await bcrypt.hash(password, 10);
 
     const user = await User.create({
       name,
-      username: username.toLowerCase(),
-      email: email.toLowerCase(),
+      username: usernameLower,
+      email: emailLower,
+      phone: phone || "",
       password: hashedPassword,
+      secretId,
+      privacy: privacy || "Private Profile",
     });
 
     const token = jwt.sign({ id: user._id }, JWT_SECRET, { expiresIn: "7d" });
@@ -233,8 +401,14 @@ app.post("/api/auth/signup", async (req, res) => {
         name: user.name,
         username: user.username,
         email: user.email,
+        phone: user.phone,
+        secretId: user.secretId,
         bio: user.bio,
         profileImage: user.profileImage,
+        privacy: user.privacy,
+        blocked: user.blocked,
+        blockedReason: user.blockedReason,
+        isAdmin: user.isAdmin,
       },
     });
   } catch (error) {
@@ -258,10 +432,13 @@ app.post("/api/auth/login", async (req, res) => {
       });
     }
 
+    const value = emailOrUsername.toLowerCase();
+
     const user = await User.findOne({
       $or: [
-        { email: emailOrUsername.toLowerCase() },
-        { username: emailOrUsername.toLowerCase() },
+        { email: value },
+        { username: value },
+        { secretId: value },
       ],
     });
 
@@ -269,6 +446,15 @@ app.post("/api/auth/login", async (req, res) => {
       return res.status(400).json({
         success: false,
         message: "User not found",
+      });
+    }
+
+    if (user.blocked) {
+      return res.status(403).json({
+        success: false,
+        message: "Your account is blocked",
+        blocked: true,
+        blockedReason: user.blockedReason || "",
       });
     }
 
@@ -291,8 +477,14 @@ app.post("/api/auth/login", async (req, res) => {
         name: user.name,
         username: user.username,
         email: user.email,
+        phone: user.phone,
+        secretId: user.secretId,
         bio: user.bio,
         profileImage: user.profileImage,
+        privacy: user.privacy,
+        blocked: user.blocked,
+        blockedReason: user.blockedReason,
+        isAdmin: user.isAdmin,
       },
     });
   } catch (error) {
@@ -323,7 +515,7 @@ app.get("/api/auth/me", auth, async (req, res) => {
 // Update profile
 app.put("/api/auth/profile", auth, async (req, res) => {
   try {
-    const { name, bio, profileImage } = req.body;
+    const { name, bio, profileImage, phone, privacy } = req.body;
 
     const updatedUser = await User.findByIdAndUpdate(
       req.user._id,
@@ -331,6 +523,8 @@ app.put("/api/auth/profile", auth, async (req, res) => {
         ...(name !== undefined && { name }),
         ...(bio !== undefined && { bio }),
         ...(profileImage !== undefined && { profileImage }),
+        ...(phone !== undefined && { phone }),
+        ...(privacy !== undefined && { privacy }),
       },
       { new: true }
     ).select("-password");
@@ -368,12 +562,15 @@ app.post("/api/posts", auth, async (req, res) => {
     const post = await Post.create({
       user: req.user._id,
       authorName: req.user.name,
+      secretId: req.user.secretId || "",
+      email: req.user.email || "",
+      phone: req.user.phone || "",
       text: text || "",
       image: image || "",
     });
 
     const populatedPost = await Post.findById(post._id)
-      .populate("user", "name username profileImage")
+      .populate("user", "name username profileImage secretId privacy blocked")
       .populate("comments.user", "name username profileImage");
 
     res.status(201).json({
@@ -394,7 +591,7 @@ app.post("/api/posts", auth, async (req, res) => {
 app.get("/api/posts", async (req, res) => {
   try {
     const posts = await Post.find()
-      .populate("user", "name username profileImage")
+      .populate("user", "name username profileImage secretId privacy blocked")
       .populate("comments.user", "name username profileImage")
       .sort({ createdAt: -1 });
 
@@ -416,7 +613,7 @@ app.get("/api/posts", async (req, res) => {
 app.get("/api/posts/me", auth, async (req, res) => {
   try {
     const posts = await Post.find({ user: req.user._id })
-      .populate("user", "name username profileImage")
+      .populate("user", "name username profileImage secretId privacy blocked")
       .populate("comments.user", "name username profileImage")
       .sort({ createdAt: -1 });
 
@@ -461,7 +658,7 @@ app.put("/api/posts/:id/like", auth, async (req, res) => {
     await post.save();
 
     const updatedPost = await Post.findById(req.params.id)
-      .populate("user", "name username profileImage")
+      .populate("user", "name username profileImage secretId privacy blocked")
       .populate("comments.user", "name username profileImage");
 
     res.status(200).json({
@@ -508,7 +705,7 @@ app.post("/api/posts/:id/comment", auth, async (req, res) => {
     await post.save();
 
     const updatedPost = await Post.findById(req.params.id)
-      .populate("user", "name username profileImage")
+      .populate("user", "name username profileImage secretId privacy blocked")
       .populate("comments.user", "name username profileImage");
 
     res.status(201).json({
@@ -533,7 +730,7 @@ app.put("/api/posts/:id/share", async (req, res) => {
       { $inc: { shares: 1 } },
       { new: true }
     )
-      .populate("user", "name username profileImage")
+      .populate("user", "name username profileImage secretId privacy blocked")
       .populate("comments.user", "name username profileImage");
 
     if (!post) {
@@ -586,6 +783,179 @@ app.delete("/api/posts/:id", auth, async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Delete failed",
+      error: error.message,
+    });
+  }
+});
+
+// ======================
+// Admin Routes
+// ======================
+
+// Get all users
+app.get("/api/admin/users", adminAuth, async (req, res) => {
+  try {
+    const users = await User.find().select("-password").sort({ createdAt: -1 });
+
+    res.status(200).json({
+      success: true,
+      count: users.length,
+      users,
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: "Users fetch failed",
+      error: error.message,
+    });
+  }
+});
+
+// Get all posts
+app.get("/api/admin/posts", adminAuth, async (req, res) => {
+  try {
+    const posts = await Post.find()
+      .populate("user", "name username email phone profileImage secretId privacy blocked")
+      .populate("comments.user", "name username profileImage")
+      .sort({ createdAt: -1 });
+
+    res.status(200).json({
+      success: true,
+      count: posts.length,
+      posts,
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: "Admin posts fetch failed",
+      error: error.message,
+    });
+  }
+});
+
+// Get admin stats
+app.get("/api/admin/stats", adminAuth, async (req, res) => {
+  try {
+    const totalUsers = await User.countDocuments();
+    const blockedUsers = await User.countDocuments({ blocked: true });
+    const totalPosts = await Post.countDocuments();
+    const totalImagePosts = await Post.countDocuments({ image: { $ne: "" } });
+    const totalWordPosts = await Post.countDocuments({ text: { $ne: "" } });
+
+    res.status(200).json({
+      success: true,
+      stats: {
+        totalUsers,
+        blockedUsers,
+        activeUsers: totalUsers - blockedUsers,
+        totalPosts,
+        totalImagePosts,
+        totalWordPosts,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: "Stats fetch failed",
+      error: error.message,
+    });
+  }
+});
+
+// Block / Unblock user
+app.put("/api/admin/users/:id/block", adminAuth, async (req, res) => {
+  try {
+    const { blocked, blockedReason } = req.body;
+
+    const user = await User.findById(req.params.id).select("-password");
+
+      if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found",
+      });
+    }
+
+    if (user.isAdmin) {
+      return res.status(400).json({
+        success: false,
+        message: "Admin user cannot be blocked",
+      });
+    }
+
+    user.blocked = !!blocked;
+    user.blockedReason = blocked ? (blockedReason || "Blocked by admin") : "";
+    await user.save();
+
+      res.status(200).json({
+      success: true,
+      message: blocked ? "User blocked successfully" : "User unblocked successfully",
+      user,
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: "Block action failed",
+      error: error.message,
+    });
+  }
+});
+
+// Delete any post by admin
+app.delete("/api/admin/posts/:id", adminAuth, async (req, res) => {
+  try {
+    const post = await Post.findByIdAndDelete(req.params.id);
+    
+    if (!post) {
+      return res.status(404).json({
+        success: false,
+        message: "Post not found",
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      message: "Post deleted by admin",
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: "Admin post delete failed",
+      error: error.message,
+    });
+  }
+});
+
+// Delete user + all posts
+app.delete("/api/admin/users/:id", adminAuth, async (req, res) => {
+  try {
+    const user = await User.findById(req.params.id);
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found",
+      });
+    }
+
+    if (user.isAdmin) {
+      return res.status(400).json({
+        success: false,
+        message: "Admin user cannot be deleted",
+      });
+    }
+
+    await Post.deleteMany({ user: req.params.id });
+    await User.findByIdAndDelete(req.params.id);
+
+    res.status(200).json({
+      success: true,
+      message: "User and related posts deleted successfully",
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: "Admin user delete failed",
       error: error.message,
     });
   }
